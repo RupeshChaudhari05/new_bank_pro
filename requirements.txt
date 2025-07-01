@@ -8,3 +8,5 @@ PyMuPDF
 pandas
 openpyxl
 python-multipart
+xlsxwriter
+apscheduler
