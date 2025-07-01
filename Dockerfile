@@ -4,7 +4,7 @@ FROM python:3.10-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies for paddleocr, pymupdf, etc.
+# Install system dependencies needed by paddleocr, pymupdf, etc.
 RUN apt-get update && apt-get install -y \
     git \
     build-essential \
@@ -15,6 +15,9 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     poppler-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip to latest version
+RUN pip install --upgrade pip
 
 # Copy requirements file
 COPY requirements.txt .
@@ -31,5 +34,5 @@ RUN mkdir temp_files
 # Expose port
 EXPOSE 8000
 
-# Run the server
+# Run the FastAPI server
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
