@@ -1,7 +1,11 @@
 services:
-  - type: worker
-    name: paddleocr-table-worker
+  - type: web
+    name: paddleocr-web-api
     env: python
+    plan: free
     buildCommand: ""
     startCommand: bash start.sh
-    plan: free
+    autoDeploy: true
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
