@@ -3,3 +3,4 @@ paddlepaddle
 fastapi
 uvicorn
 lmdb
+python-multipart
