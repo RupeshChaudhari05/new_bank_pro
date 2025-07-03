@@ -4,3 +4,4 @@ fastapi
 uvicorn
 lmdb
 python-multipart
+scikit-image
