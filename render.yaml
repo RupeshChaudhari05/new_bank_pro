@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: paddleocr-table-worker
+    env: python
+    buildCommand: ""
+    startCommand: bash start.sh
+    plan: free
