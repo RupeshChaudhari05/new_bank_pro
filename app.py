@@ -30,7 +30,7 @@ app = FastAPI(
 )
 
 # Allowed frontend domains
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost,http://localhost:8000").split(",")
 
 def check_origin(request: Request):
     origin = request.headers.get("origin") or request.headers.get("referer")
