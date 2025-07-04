@@ -7,3 +7,4 @@ pdf2image
 Pillow
 opencv-python-headless
 pandas
+python-multipart
