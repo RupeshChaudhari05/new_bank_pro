@@ -1,10 +1,10 @@
-fastapi
-uvicorn
-paddleocr
-layoutparser[layoutmodels,paddledetection]
-tensorflow
-pdf2image
+flask
+gunicorn
+layoutparser
 Pillow
 opencv-python-headless
+numpy
 pandas
-python-multipart
+tensorflow
+pdf2image
+paddleocr
