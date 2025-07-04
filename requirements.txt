@@ -1,8 +1,9 @@
-paddleocr
-paddlepaddle
 fastapi
 uvicorn
-lmdb
-python-multipart
-scikit-image
-albumentations
+paddleocr
+layoutparser[layoutmodels,paddledetection]
+tensorflow
+pdf2image
+Pillow
+opencv-python-headless
+pandas
