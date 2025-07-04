@@ -1,172 +1,560 @@
 import os
-import tempfile
-import zipfile
+import shutil
+import uuid
+import time
 import logging
-from flask import Flask, request, send_file
-import layoutparser as lp
-from PIL import Image
-import cv2
+import io
 import numpy as np
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Depends
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
+import pdfplumber
 import pandas as pd
-import tensorflow as tf
-from pdf2image import convert_from_path
-from paddleocr import PaddleOCR
+import cv2
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB upload limit
+# Directory to store temp files
+TEMP_DIR = "/app/temp_files"
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
 
-# Initialize the layout detection model
-model = lp.PaddleDetectionLayoutModel(
-    config_path="lp://PubLayNet/ppyolov2_r50vd_dcn_365e_publaynet/config",
-    threshold=0.5,
-    label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"},
-    enforce_cpu=False,
-    enable_mkldnn=True
+# FastAPI app setup
+app = FastAPI(
+    title="Advanced PDF Table Extractor API",
+    description="Extract tables from PDFs using traditional methods + OCR fallback. Supports Excel, CSV, JSON, and Tally XML outputs.",
+    version="3.0.0-prod"
 )
 
-def intersection(box_1, box_2):
-    return [box_2[0], box_1[1], box_2[2], box_1[3]]
+# Allowed frontend domains
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
 
-def iou(box_1, box_2):
-    x_1 = max(box_1[0], box_2[0])
-    y_1 = max(box_1[1], box_2[1])
-    x_2 = min(box_1[2], box_2[2])
-    y_2 = min(box_1[3], box_2[3])
-    inter = abs(max((x_2 - x_1, 0)) * max((y_2 - y_1, 0)))
-    if inter == 0:
-        return 0
-    box_1_area = abs((box_1[2] - box_1[0]) * (box_1[3] - box_1[1]))
-    box_2_area = abs((box_2[2] - box_2[0]) * (box_2[3] - box_2[1]))
-    return inter / float(box_1_area + box_2_area - inter)
+def check_origin(request: Request):
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if not origin:
+        raise HTTPException(status_code=403, detail="No origin header.")
+    if not any(origin.startswith(allowed) for allowed in ALLOWED_ORIGINS):
+        raise HTTPException(status_code=403, detail=f"Origin not allowed: {origin}")
 
-def get_csv(csv_path, im, pg, tab, x_1, x_2, y_1, y_2):
-    try:
-        cv2.imwrite('ext_im.jpg', im[y_1:y_2, x_1:x_2])
-        ocr = PaddleOCR(lang='en')
-        image_path = 'ext_im.jpg'
-        image_cv = cv2.imread(image_path)
-        image_height = image_cv.shape[0]
-        image_width = image_cv.shape[1]
-        output = ocr.ocr(image_path)[0]
-        boxes = [line[0] for line in output]
-        texts = [line[1][0] for line in output]
-        probabilities = [line[1][1] for line in output]
-        image_boxes = image_cv.copy()
-        for box, text in zip(boxes, texts):
-            cv2.rectangle(image_boxes, (int(box[0][0]), int(box[0][1])), 
-                          (int(box[2][0]), int(box[2][1])), (0, 0, 255), 1)
-            cv2.putText(image_boxes, text, (int(box[0][0]), int(box[0][1])), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (222, 0, 0), 1)
-        im = image_cv.copy()
-        horiz_boxes = []
-        vert_boxes = []
-        for box in boxes:
-            x_h, x_v = 0, int(box[0][0])
-            y_h, y_v = int(box[0][1]), 0
-            width_h, width_v = image_width, int(box[2][0] - box[0][0])
-            height_h, height_v = int(box[2][1] - box[0][1]), image_height
-            horiz_boxes.append([x_h, y_h, x_h + width_h, y_h + height_h])
-            vert_boxes.append([x_v, y_v, x_v + width_v, y_v + height_v])
-            cv2.rectangle(im, (x_h, y_h), (x_h + width_h, y_h + height_h), (0, 0, 255), 1)
-            cv2.rectangle(im, (x_v, y_v), (x_v + width_v, y_v + height_v), (0, 255, 0), 1)
-        horiz_out = tf.image.non_max_suppression(
-            horiz_boxes, probabilities, max_output_size=1000, iou_threshold=0.1, 
-            score_threshold=float('-inf'), name=None
-        )
-        horiz_lines = np.sort(np.array(horiz_out))
-        im_nms = image_cv.copy()
-        for val in horiz_lines:
-            cv2.rectangle(im_nms, (int(horiz_boxes[val][0]), int(horiz_boxes[val][1])), 
-                          (int(horiz_boxes[val][2]), int(horiz_boxes[val][3])), (0, 0, 255), 1)
-        vert_out = tf.image.non_max_suppression(
-            vert_boxes, probabilities, max_output_size=1000, iou_threshold=0.1, 
-            score_threshold=float('-inf'), name=None
-        )
-        vert_lines = np.sort(np.array(vert_out))
-        for val in vert_lines:
-            cv2.rectangle(im_nms, (int(vert_boxes[val][0]), int(vert_boxes[val][1])), 
-                          (int(vert_boxes[val][2]), int(vert_boxes[val][3])), (255, 0, 0), 1)
-        out_array = [["" for i in range(len(vert_lines))] for j in range(len(horiz_lines))]
-        unordered_boxes = []
-        for i in vert_lines:
-            unordered_boxes.append(vert_boxes[i][0])
-        ordered_boxes = np.argsort(unordered_boxes)
-        for i in range(len(horiz_lines)):
-            for j in range(len(vert_lines)):
-                resultant = intersection(horiz_boxes[horiz_lines[i]], vert_boxes[vert_lines[ordered_boxes[j]]])
-                for b in range(len(boxes)):
-                    the_box = [boxes[b][0][0], boxes[b][0][1], boxes[b][2][0], boxes[b][2][1]]
-                    if iou(resultant, the_box) > 0.1:
-                        out_array[i][j] = texts[b]
-        out_array = np.array(out_array)
-        pd.DataFrame(out_array).to_csv(os.path.join(csv_path, f"{pg}_{tab}.csv"))
-    except Exception as e:
-        logger.error(f"Error in get_csv for table {tab} of {pg}: {e}")
-        raise
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def extract_tables_from_pdf(pdf_path, out_dir, pdf_name):
-    try:
-        images = convert_from_path(pdf_path)
-    except Exception as e:
-        logger.error(f"Error converting PDF {pdf_name}: {e}")
-        raise
-    pages_dir = os.path.join(out_dir, 'pages')
-    os.makedirs(pages_dir, exist_ok=True)
-    k = 1
-    for i in range(len(images)):
-        image_path = os.path.join(pages_dir, f'_{i}.jpg')
-        images[i].save(image_path, 'JPEG')
-        image = cv2.imread(image_path)
-        image = image[..., ::-1]
-        layout = model.detect(image)
-        for l in layout:
-            if l.type == 'Table':
-                x_1 = int(l.block.x_1)
-                y_1 = int(l.block.y_1)
-                x_2 = int(l.block.x_2)
-                y_2 = int(l.block.y_2)
-                im = cv2.imread(image_path)
+# Background cleanup job
+CLEANUP_INTERVAL = 600  # 10 minutes
+FILE_LIFETIME = 600     # 10 minutes
+
+def cleanup_temp_files():
+    """Delete files older than FILE_LIFETIME"""
+    logger.info("Running temp file cleanup")
+    now = time.time()
+    for folder in os.listdir(TEMP_DIR):
+        folder_path = os.path.join(TEMP_DIR, folder)
+        if os.path.isdir(folder_path):
+            mtime = os.path.getmtime(folder_path)
+            if now - mtime > FILE_LIFETIME:
                 try:
-                    get_csv(out_dir, im, pdf_name, k, x_1, x_2, y_1, y_2)
-                    k += 1
+                    shutil.rmtree(folder_path)
+                    logger.info(f"Deleted expired folder: {folder}")
                 except Exception as e:
-                    logger.error(f"Error processing table {k} on page {i} of {pdf_name}: {e}")
-                    continue
+                    logger.error(f"Cleanup failed for {folder}: {str(e)}")
 
-@app.route('/extract-tables', methods=['POST'])
-def extract_tables():
+scheduler = BackgroundScheduler()
+scheduler.add_job(cleanup_temp_files, 'interval', seconds=CLEANUP_INTERVAL)
+scheduler.start()
+
+# Helper: OCR-based table extraction with image enhancement
+def extract_tables_with_ocr(pdf_bytes, enhance_images=True):
+    """Fallback table extraction using PaddleOCR when no tables found"""
     try:
-        if 'pdf_file' not in request.files:
-            logger.error("No PDF file uploaded")
-            return "No PDF file uploaded", 400
-        file = request.files['pdf_file']
-        if file.filename == '':
-            logger.error("No file selected")
-            return "No file selected", 400
-        if file and file.filename.lower().endswith('.pdf'):
-            with tempfile.TemporaryDirectory() as tmpdirname:
-                pdf_name = os.path.splitext(file.filename)[0]
-                pdf_path = os.path.join(tmpdirname, file.filename)
-                file.save(pdf_path)
-                out_dir = os.path.join(tmpdirname, 'outputs')
-                os.makedirs(out_dir, exist_ok=True)
-                extract_tables_from_pdf(pdf_path, out_dir, pdf_name)
-                zip_path = os.path.join(tmpdirname, 'tables.zip')
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    for root, _, files in os.walk(out_dir):
-                        for f in files:
-                            if f.endswith('.csv'):
-                                zipf.write(os.path.join(root, f), f)
-                return send_file(zip_path, as_attachment=True, download_name='tables.zip')
-        logger.error("Invalid file type, please upload a PDF")
-        return "Invalid file type, please upload a PDF", 400
-    except Exception as e:
-        logger.error(f"Error in extract-tables endpoint: {e}")
-        return "An error occurred during processing", 500
+        from pdf2image import convert_from_bytes
+        from paddleocr import PPStructure, draw_structure_result
+        from PIL import Image, ImageEnhance
+    except ImportError as e:
+        logger.error("OCR dependencies not installed: " + str(e))
+        return []
 
-if __name__ == "__main__":
-    app.run(debug=True)
+    tables = []
+    try:
+        # Convert PDF to images (use 300 DPI for better OCR accuracy)
+        images = convert_from_bytes(
+            pdf_bytes, 
+            dpi=300,
+            thread_count=4,
+            poppler_path=os.getenv("POPPLER_PATH", "/usr/bin")
+        )
+        
+        # Initialize OCR engine with optimized settings
+        table_engine = PPStructure(
+            show_log=False,
+            ocr=True,  # Enable OCR for text recognition
+            layout=True,  # Enable layout analysis
+            table=True,  # Enable table recognition
+            lang='en'  # English language
+        )
+        
+        for page_num, image in enumerate(images, 1):
+            try:
+                # Enhance low-quality images
+                if enhance_images:
+                    # Increase contrast
+                    enhancer = ImageEnhance.Contrast(image)
+                    image = enhancer.enhance(1.5)
+                    
+                    # Increase sharpness
+                    enhancer = ImageEnhance.Sharpness(image)
+                    image = enhancer.enhance(2.0)
+                
+                # Convert to OpenCV format
+                img_np = np.array(image)
+                img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                
+                # Process with PaddleOCR
+                result = table_engine(img_cv)
+                
+                for region in result:
+                    if region['type'].lower() == 'table':
+                        html_str = region['res']['html']
+                        try:
+                            # Parse HTML table to DataFrame
+                            dfs = pd.read_html(html_str)
+                            if dfs:
+                                df = dfs[0]
+                                
+                                # Clean up OCR artifacts
+                                df = df.replace(r'^\s*$', np.nan, regex=True)
+                                df = df.dropna(how='all').reset_index(drop=True)
+                                
+                                tables.append({
+                                    "page": page_num,
+                                    "data": df,
+                                    "method": "ocr"
+                                })
+                        except Exception as e:
+                            logger.warning(f"Table parsing failed on page {page_num}: {str(e)}")
+            except Exception as page_e:
+                logger.error(f"OCR processing failed on page {page_num}: {str(page_e)}")
+        
+        return tables
+    except Exception as e:
+        logger.error(f"OCR processing failed: {str(e)}")
+        return []
+
+# Supported output formats
+SUPPORTED_FORMATS = ["html", "excel", "csv", "json", "tallyxml"]
+
+def extract_balances(tables):
+    """Extract opening and closing balances from financial tables"""
+    if not tables:
+        return None, None
+    
+    # Try to find a table with balance information
+    for table in tables:
+        df = table['data']
+        if df.empty:
+            continue
+            
+        # Find potential balance column
+        balance_col = None
+        for col in df.columns:
+            if col and any(keyword in str(col).lower() for keyword in ['balance', 'bal']):
+                balance_col = col
+                break
+                
+        if balance_col:
+            try:
+                # Clean balance values (remove non-numeric characters)
+                df[balance_col] = df[balance_col].astype(str).str.replace(r'[^\d.]', '', regex=True)
+                df[balance_col] = pd.to_numeric(df[balance_col], errors='coerce')
+                
+                # Find first and last valid balances
+                valid_balances = df[balance_col].dropna()
+                if len(valid_balances) > 1:
+                    return valid_balances.iloc[0], valid_balances.iloc[-1]
+            except Exception:
+                continue
+                
+    return None, None
+
+def to_tally_xml(tables):
+    """Convert table data to Tally XML format"""
+    if not tables:
+        return ""
+    
+    # Use the first table that looks like a financial statement
+    for table in tables:
+        df = table['data']
+        if df.empty:
+            continue
+            
+        # Identify columns by common financial headers
+        col_mapping = {}
+        for col in df.columns:
+            if not col:
+                continue
+            lcol = str(col).lower()
+            if 'date' in lcol:
+                col_mapping['date'] = col
+            elif 'desc' in lcol or 'particular' in lcol or 'narration' in lcol:
+                col_mapping['desc'] = col
+            elif 'debit' in lcol:
+                col_mapping['debit'] = col
+            elif 'credit' in lcol:
+                col_mapping['credit'] = col
+            elif 'balance' in lcol:
+                col_mapping['balance'] = col
+                
+        # Require at least date and description
+        if 'date' in col_mapping and 'desc' in col_mapping:
+            break
+    else:
+        # No suitable table found
+        return ""
+    
+    # Build XML structure
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<ENVELOPE>',
+        ' <HEADER>',
+        '  <TALLYREQUEST>Import Data</TALLYREQUEST>',
+        ' </HEADER>',
+        ' <BODY>',
+        '  <IMPORTDATA>',
+        '   <REQUESTDESC>',
+        '    <REPORTNAME>Vouchers</REPORTNAME>',
+        '   </REQUESTDESC>',
+        '   <REQUESTDATA>',
+    ]
+    
+    # Add voucher entries
+    for _, row in df.iterrows():
+        date_val = str(row[col_mapping['date']]) if 'date' in col_mapping else ''
+        desc_val = str(row[col_mapping['desc']]) if 'desc' in col_mapping else ''
+        debit_val = str(row[col_mapping['debit']]) if 'debit' in col_mapping else '0'
+        credit_val = str(row[col_mapping['credit']]) if 'credit' in col_mapping else '0'
+        balance_val = str(row[col_mapping['balance']]) if 'balance' in col_mapping else ''
+        
+        # Clean numeric values
+        for val in [debit_val, credit_val, balance_val]:
+            val = ''.join(filter(lambda x: x.isdigit() or x in ['.', '-'], val))
+        
+        xml_lines += [
+            '    <TALLYMESSAGE>',
+            '     <VOUCHER VCHTYPE="Bank Statement" ACTION="Create">',
+            f'      <DATE>{date_val}</DATE>',
+            f'      <NARRATION>{desc_val}</NARRATION>',
+        ]
+        
+        if debit_val and float(debit_val) > 0:
+            xml_lines.append(f'      <DEBIT>{debit_val}</DEBIT>')
+        if credit_val and float(credit_val) > 0:
+            xml_lines.append(f'      <CREDIT>{credit_val}</CREDIT>')
+        if balance_val:
+            xml_lines.append(f'      <BALANCE>{balance_val}</BALANCE>')
+            
+        xml_lines += [
+            '     </VOUCHER>',
+            '    </TALLYMESSAGE>'
+        ]
+    
+    xml_lines += [
+        '   </REQUESTDATA>',
+        '  </IMPORTDATA>',
+        ' </BODY>',
+        '</ENVELOPE>'
+    ]
+    
+    return '\n'.join(xml_lines)
+
+def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
+    """Main extraction function with fallback to OCR"""
+    tables = []
+    unique_tables = {}
+    non_blank_pages = set()
+    extraction_method = "pdfplumber"
+    ocr_fallback = False
+    
+    # First attempt: Traditional PDF extraction
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                try:
+                    found_table = False
+                    for table in page.find_tables():
+                        data = table.extract()
+                        if data and len(data) > 1:
+                            df = pd.DataFrame(data[1:], columns=data[0])
+                            
+                            # Basic cleaning
+                            df = df.replace(r'^\s*$', np.nan, regex=True)
+                            df = df.dropna(how='all').reset_index(drop=True)
+                            
+                            if not df.empty:
+                                tables.append({
+                                    "page": page_num,
+                                    "data": df,
+                                    "method": "traditional"
+                                })
+                                non_blank_pages.add(page_num)
+                                found_table = True
+                                
+                                # Track for merged CSV
+                                headers_key = tuple(df.columns)
+                                if headers_key not in unique_tables:
+                                    unique_tables[headers_key] = []
+                                unique_tables[headers_key].append(df)
+                    
+                    if found_table:
+                        non_blank_pages.add(page_num)
+                except Exception as page_e:
+                    logger.error(f"Page {page_num} processing error: {str(page_e)}")
+    except Exception as e:
+        logger.warning(f"PDF extraction failed: {str(e)}")
+    
+    # Fallback to OCR if no tables found
+    if not tables:
+        logger.info("No tables found traditionally. Attempting OCR extraction...")
+        ocr_tables = extract_tables_with_ocr(pdf_bytes, enhance_images=True)
+        if ocr_tables:
+            tables = ocr_tables
+            extraction_method = "paddleocr"
+            ocr_fallback = True
+            
+            # Process OCR-extracted tables
+            for table in tables:
+                page_num = table["page"]
+                df = table["data"]
+                non_blank_pages.add(page_num)
+                
+                # Track for merged CSV
+                headers_key = tuple(df.columns)
+                if headers_key not in unique_tables:
+                    unique_tables[headers_key] = []
+                unique_tables[headers_key].append(df)
+    
+    if not tables:
+        return 0, 0, None, None, extraction_method, False
+    
+    # Use file_map for output names if provided
+    if file_map is None:
+        file_map = {
+            "html": "tables.html",
+            "excel": "tables.xlsx",
+            "csv": "tables.csv",
+            "json": "tables.json",
+            "tallyxml": "tables_tally.xml"
+        }
+    
+    # Save HTML
+    html = ""
+    for i, t in enumerate(tables):
+        html += f"<h3>Page {t['page']} - Table {i+1}</h3>"
+        html += t['data'].to_html(index=False, border=1, classes="table table-striped")
+    with open(os.path.join(out_dir, file_map["html"]), "w", encoding="utf-8") as f:
+        f.write(f"<html><body>{html}</body></html>")
+    
+    # Save Excel
+    with pd.ExcelWriter(os.path.join(out_dir, file_map["excel"]), engine='xlsxwriter') as writer:
+        for i, t in enumerate(tables):
+            sheet_name = f"Pg{t['page']}_T{i+1}"[:31]  # Excel sheet name limit
+            t['data'].to_excel(writer, sheet_name=sheet_name, index=False)
+    
+    # Save CSV (merge tables with same headers)
+    with open(os.path.join(out_dir, file_map["csv"]), "w", encoding="utf-8") as f:
+        for headers, dfs in unique_tables.items():
+            merged_df = pd.concat(dfs, ignore_index=True)
+            merged_df.to_csv(f, index=False)
+            f.write("\n\n")
+    
+    # Save JSON
+    json_data = []
+    for i, t in enumerate(tables):
+        json_data.append({
+            "table": i+1,
+            "page": t['page'],
+            "method": t.get("method", "unknown"),
+            "columns": list(t['data'].columns),
+            "rows": t['data'].to_dict(orient='records')
+        })
+    import json
+    with open(os.path.join(out_dir, file_map["json"]), "w", encoding="utf-8") as f:
+        json.dump(json_data, f, ensure_ascii=False, indent=2)
+    
+    # Save Tally XML
+    tally_xml = to_tally_xml(tables)
+    with open(os.path.join(out_dir, file_map["tallyxml"]), "w", encoding="utf-8") as f:
+        f.write(tally_xml)
+    
+    # Extract balances
+    opening, closing = extract_balances(tables)
+    
+    return len(tables), len(non_blank_pages), opening, closing, extraction_method, ocr_fallback
+
+@app.post("/upload")
+async def upload_pdf(
+    file: UploadFile = File(...),
+    password: str = Form(None),
+    request: Request = None,
+    _: None = Depends(check_origin)
+):
+    """Handle PDF uploads and process extraction"""
+    # Validate file type
+    if not file.filename.lower().endswith('.pdf'):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False, 
+                "error_code": "INVALID_FILE_TYPE",
+                "message": "Only PDF files are allowed."
+            }
+        )
+    
+    try:
+        pdf_bytes = await file.read()
+        file_id = str(uuid.uuid4())
+        out_dir = os.path.join(TEMP_DIR, file_id)
+        os.makedirs(out_dir, exist_ok=True)
+        
+        # Create output file names based on original filename
+        base_name = os.path.splitext(file.filename)[0].replace(" ", "_")
+        file_map = {
+            "html": f"{base_name}.html",
+            "excel": f"{base_name}.xlsx", 
+            "csv": f"{base_name}.csv",
+            "json": f"{base_name}.json",
+            "tallyxml": f"{base_name}_tally.xml"
+        }
+        
+        # Save original PDF
+        with open(os.path.join(out_dir, "original.pdf"), "wb") as f:
+            f.write(pdf_bytes)
+        
+        # Process PDF
+        try:
+            tables_found, pages_count, opening_balance, closing_balance, method, ocr_fallback = extract_and_save(
+                pdf_bytes, out_dir, password=password, file_map=file_map
+            )
+        except Exception as e:
+            logger.error(f"Processing failed: {str(e)}")
+            shutil.rmtree(out_dir)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "error_code": "PROCESSING_ERROR",
+                    "message": "Failed to process PDF",
+                    "details": str(e)
+                }
+            )
+        
+        if tables_found == 0:
+            shutil.rmtree(out_dir)
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "error_code": "NO_TABLES_FOUND",
+                    "message": "No tables found in the PDF.",
+                    "pages_count": pages_count
+                }
+            )
+        
+        # Create download links
+        links = {fmt: f"/download/{file_id}/{fmt}" for fmt in SUPPORTED_FORMATS}
+        
+        return {
+            "success": True,
+            "tables_found": tables_found,
+            "pages_count": pages_count,
+            "file_id": file_id,
+            "extraction_method": method,
+            "ocr_fallback": ocr_fallback,
+            "download_links": links,
+            "output_file_names": file_map,
+            "opening_balance": str(opening_balance) if opening_balance else None,
+            "closing_balance": str(closing_balance) if closing_balance else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Upload failed: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error_code": "SERVER_ERROR",
+                "message": "Internal server error"
+            }
+        )
+
+@app.get("/download/{file_id}/{fmt}")
+def download_file(file_id: str, fmt: str):
+    """Serve extracted files for download"""
+    if fmt not in SUPPORTED_FORMATS:
+        raise HTTPException(status_code=400, detail="Invalid format.")
+    
+    # Prevent path traversal
+    safe_id = file_id.replace("..", "").replace("/", "")
+    out_dir = os.path.join(TEMP_DIR, safe_id)
+    
+    if not os.path.exists(out_dir):
+        raise HTTPException(status_code=404, detail="File not found or expired.")
+    
+    # Find matching file
+    ext_map = {
+        "html": ".html",
+        "excel": ".xlsx", 
+        "csv": ".csv",
+        "json": ".json",
+        "tallyxml": "_tally.xml"
+    }
+    
+    target_file = None
+    for file in os.listdir(out_dir):
+        if file.endswith(ext_map[fmt]):
+            target_file = file
+            break
+    
+    if not target_file:
+        raise HTTPException(status_code=404, detail="Requested format not found.")
+    
+    file_path = os.path.join(out_dir, target_file)
+    
+    # Set appropriate media types
+    media_types = {
+        "html": "text/html",
+        "excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "csv": "text/csv",
+        "json": "application/json",
+        "tallyxml": "application/xml"
+    }
+    
+    return FileResponse(
+        file_path,
+        media_type=media_types[fmt],
+        filename=target_file
+    )
+
+@app.get("/health")
+def health_check():
+    """Endpoint for health checks"""
+    return {"status": "ok", "timestamp": time.time()}
+
+@app.get("/")
+def root():
+    """API information endpoint"""
+    return {
+        "message": "Advanced PDF Table Extractor API",
+        "version": app.version,
+        "endpoints": {
+            "POST /upload": "Upload PDF for table extraction",
+            "GET /download/{file_id}/{format}": "Download extracted tables",
+            "GET /health": "Service health check"
+        }
+    }
